@@ -12,12 +12,18 @@ docker compose up --build
 # 打开 http://localhost:8000/docs 在页面上传文件（FastAPI Swagger UI）
 ```
 
-不需要 Docker 时：
+登记包、补录原值都写入 SQLite；compose 把数据库放在命名卷
+`handoff-data` 的 `/data/review.db` 上，容器重建后仍保留。不用 Docker 时：
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+GAUGE_DB_PATH=data/review.db python3 -m uvicorn app.main:app \
+    --host 0.0.0.0 --port 8000
 ```
+
+`GAUGE_DB_PATH` 缺省为 `data/review.db`。`/healthz` 会真正读一次数据库：
+可用时返回 `200` 且 `"database": "ready"`，不可用时返回 `503` 且
+`"database": "unavailable"`，复核接口同时返回 `503`。
 
 ## 接口
 
@@ -25,7 +31,11 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/api/packages` | CSV + 三个限制 → 交接包（`application/octet-stream`） |
 | POST | `/api/inspect` | 交接包（可选原始 CSV）→ 数值、判定、核对报告 |
-| GET | `/healthz` | 健康检查 |
+| POST | `/api/review/packages` | 登记 `.tgp`（上传文件）→ 持久化包号 |
+| GET | `/api/review/packages/{包号}` | 已登记包的信息与补录数量 |
+| POST | `/api/review/packages/{包号}/rejudge` | 新合格闭区间下复判采样号范围 |
+| POST | `/api/review/packages/{包号}/supplements` | 批量补录采样号与原值 |
+| GET | `/healthz` | 健康检查（含 SQLite 可用性） |
 | GET | `/docs` | 交互文档，可直接上传文件 |
 
 `/api/packages` 的表单字段：
@@ -41,6 +51,65 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 失败时返回 JSON `{"detail": ...}`：`400` 表示 CSV/参数不合法，
 `413` 表示在字节上限内无法交付完整包——此时**不会**返回任何部分数据。
+
+## 复核流程（登记、复判、补录）
+
+轨距合格区间调整后，复核员不需要重新解码整包，按下列顺序即可知道旧交接包
+里哪些采样能直接复判、哪些必须找原始记录：
+
+1. **登记**：`POST /api/review/packages` 上传 `.tgp`，返回从 1 起算的包号。
+   包本身、逐点解码值与逐点**可能原值区间**都写入 SQLite。
+2. **复判**：`POST /api/review/packages/{包号}/rejudge`
+
+   ```json
+   {"first_sample": 1, "last_sample": 500, "lower": 1434000, "upper": 1436000}
+   ```
+
+   返回该范围内每个采样号一条记录，`verdict` 为
+   `narrow` / `pass` / `wide` / `unknown`（标签 `偏窄` / `合格` / `偏宽` / `待查`），
+   并附 `counts` 汇总。采样号从 1 起、闭区间含两端。
+
+   每条记录带：
+
+   * `source`：`decoded`（按包内解码值）或 `supplement`（按补录原值）。
+     补录点的 `value` 是原值，未补录的近似点 `value` 为 `null`；
+   * `decoded`：包内解码值，便于和原值对照；
+   * `possible`：该点可能原值的闭区间；
+   * `certain`：结论是否确定；`unknown` 时 `candidates` 列出可能的判定。
+
+3. **补录**：`POST /api/review/packages/{包号}/supplements`
+
+   ```json
+   {"samples": [{"sample_no": 17, "value": 1435003},
+                {"sample_no": 23, "value": 1436001}]}
+   ```
+
+   已补录的点以后一律按原值判定（`source: "supplement"`），换区间后仍然有效。
+
+### 复判规则
+
+* **无损包**：以解码值为原值，结论总是确定（`narrow` / `pass` / `wide`）。
+* **近似包**：某个采样的**可能原值**必须同时满足
+  * 与解码值之差的绝对值不超过包内误差上限 `eps`；
+  * 其**旧判定**（按包内记录的旧合格区间）与解码值的旧判定一致：
+    旧 `pass` 落在旧闭区间内、旧 `narrow` 严格小于旧下界、
+    旧 `wide` 严格大于旧上界。
+
+  在这个可能区间上，如果所有值的**新判定一致**，直接返回该判定；否则返回
+   `unknown`（待查），并在 `candidates` 里列出该区间覆盖的候选判定，复核员据此
+  决定是找原始记录还是补录原值。绝不在可能原值给出不同结论时臆断一个判定。
+* 无损包即使头部带有非零 `eps`，只要包未被标记为近似，仍以解码值为准。
+* 判定区间始终是**闭区间**：`value == lower` 或 `value == upper` 都算合格。
+
+### 补录规则（整批原子）
+
+* 采样号无效（`< 1` 或超过包内采样数）、补录值超出该点可能区间、
+  或同一采样号在一个批次里出现两个不同值（`异常值`）时，**整批退回**：
+  响应 `400`，本批一行都不写，已存原值保持不变。
+* 同一采样号重复提交**相同**值算成功（`stored` / `unchanged` 计数区分），
+  补录只需查询涉及的采样，不会重新解码整包。
+* 一次复判查询在单个事务内完成；在 WAL 模式下即使另一请求正在提交补录，
+  整段查询取到的原值也来自同一个已提交快照，不会一半旧一半新。
 
 ## 判定与误差规则
 
@@ -94,4 +163,6 @@ python3 -m pytest -q
 
 覆盖：闭区间端点判定、五种编码往返、CRC 损坏检测、CSV 边界输入、
 字节上限两侧（恰好装入 / 少 1 字节则 413）、近似路径（误差与判定校验）、
-无法装入时不交付半包、损坏包拒绝、API 端到端流程。
+无法装入时不交付半包、损坏包拒绝、API 端到端流程；复核部分覆盖登记取号、
+新旧区间边界、近似包的确定/待查判定、补录整批退回与同值重传、
+补录只查涉及采样、WAL 单快照读取，以及补录失败后已存原值保留。

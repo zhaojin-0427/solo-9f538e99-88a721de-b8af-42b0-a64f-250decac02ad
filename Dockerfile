@@ -10,7 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
+# The directory above is owned by appuser so a fresh named volume mounted at
+# /data can hold review.db.
 USER appuser
 
 EXPOSE 8000

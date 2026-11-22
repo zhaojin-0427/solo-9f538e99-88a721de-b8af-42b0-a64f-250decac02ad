@@ -2,28 +2,56 @@
 
 Endpoint summary
 ----------------
-POST /api/packages   CSV + limits in, self-describing binary package out.
-POST /api/inspect    Package (and optionally the original CSV) in, decoded
-                     readings, verdicts and an integrity report out.
-GET  /healthz        liveness probe.
+POST /api/packages                    CSV + limits in, self-describing package out.
+POST /api/inspect                     Package (+ optional original CSV) in,
+                                      decoded readings, verdicts and report out.
+POST /api/review/packages             Register a .tgp, get a persistent package no.
+GET  /api/review/packages/{no}        Registered package metadata.
+POST /api/review/packages/{no}/rejudge
+                                      Re-judge a 1-based sample range under a
+                                      new closed pass interval (SQLite-backed).
+POST /api/review/packages/{no}/supplements
+                                      Batch-record original readings.
+GET  /healthz                         liveness probe.
 
 Interactive docs (upload forms included) are served at /docs.
 """
 
 from __future__ import annotations
 
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from contextlib import asynccontextmanager
+from typing import List
 
-from . import pack, transfer
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, StrictInt
+
+from . import db, pack, review, transfer
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Prepare the SQLite file and schema before serving.  A failure here is
+    # reported but does not block packaging-only use of the service; /healthz
+    # will report the database as unavailable until it is fixed.
+    try:
+        db.ensure_ready()
+    except db.DatabaseUnavailable:
+        pass
+    yield
+
 
 app = FastAPI(
     title="轨距读数交接 API",
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=_lifespan,
     description=(
         "按采样顺序接收轨距 CSV（整数微米），生成自带解码信息与合格区间的"
         "二进制包。无损包超过字节上限时，允许在绝对误差限内近似；仍装不下则"
-        "返回 413，绝不交付半包。"
+        "返回 413，绝不交付半包。复核时可在 /docs 登记交接包取得包号，再按"
+        "包号在新合格区间下逐点复判并批量补录原值；登记与补录持久化到 SQLite。"
     ),
 )
 
@@ -38,8 +66,19 @@ def index() -> RedirectResponse:
 
 
 @app.get("/healthz", summary="Health check")
-def healthz() -> dict:
-    return {"status": "ok"}
+def healthz() -> JSONResponse:
+    # Includes a real SELECT so an unwritable or unmounted database is visible
+    # to the Docker healthcheck instead of only failing on first review request.
+    status = db.health()
+    if status["database"] == "ready":
+        return JSONResponse(content={"status": "ok", **status})
+    return JSONResponse(status_code=503,
+                        content={"status": "degraded", **status})
+
+
+@app.exception_handler(db.DatabaseUnavailable)
+async def _database_error_handler(_request, exc: db.DatabaseUnavailable):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(transfer.InputError)
@@ -50,6 +89,11 @@ async def _input_error_handler(_request, exc: transfer.InputError):
 @app.exception_handler(pack.PackageTooLarge)
 async def _too_large_handler(_request, exc: pack.PackageTooLarge):
     return JSONResponse(status_code=413, content={"detail": str(exc)})
+
+
+@app.exception_handler(review.ReviewError)
+async def _review_error_handler(_request, exc: review.ReviewError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 async def _read_upload(upload: UploadFile, limit: int) -> bytes:
@@ -162,3 +206,132 @@ async def inspect_package(
         report["max_error"] = summary["max_error"]
 
     return JSONResponse(content=report)
+
+
+# --------------------------------------------------------------------------
+# Review workflow: register a .tgp, re-judge ranges, supplement originals.
+# All state lives in SQLite (see app/db.py and app/review.py).
+# --------------------------------------------------------------------------
+
+class RejudgeRequest(BaseModel):
+    first_sample: StrictInt
+    last_sample: StrictInt
+    lower: StrictInt
+    upper: StrictInt
+
+
+class SupplementEntry(BaseModel):
+    sample_no: StrictInt
+    value: StrictInt
+
+
+class SupplementRequest(BaseModel):
+    samples: List[SupplementEntry]
+
+
+def _json_error(detail: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(request, exc: RequestValidationError):
+    # Keep the review API's error contract simple: every rejected request is a
+    # 400 with a JSON ``detail``.  Other endpoints keep FastAPI's default 422.
+    if request.url.path.startswith("/api/review/"):
+        return _json_error(
+            "; ".join(
+                f"{'.'.join(str(part) for part in err.get('loc', ()))}: "
+                f"{err.get('msg', 'invalid')}"
+                for err in exc.errors()
+            ) or "invalid request"
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.post(
+    "/api/review/packages",
+    summary="登记交接包，取得包号",
+    responses={
+        200: {"description": "包已持久化，返回包号与包内元数据"},
+        400: {"description": "包损坏或格式不支持"},
+    },
+)
+async def register_review_package(
+    file: UploadFile = File(..., description="交接包（.tgp）"),
+):
+    blob = await _read_upload(file, MAX_PACKAGE_BYTES)
+    try:
+        decoded = pack.decode_package(blob)
+    except (ValueError, pack.PackError) as exc:
+        raise transfer.InputError(f"package failed to decode: {exc}") from exc
+
+    with db.connection(write=True) as conn:
+        meta = review.register_package(conn, blob, decoded)
+
+    return {
+        "package_no": meta.package_no,
+        "sample_count": meta.sample_count,
+        "old_interval": {"lower": meta.old_lower, "upper": meta.old_upper},
+        "error_limit": meta.eps,
+        "approximated": meta.approximated,
+    }
+
+
+@app.get(
+    "/api/review/packages/{package_no}",
+    summary="已登记包的信息",
+)
+def get_review_package(package_no: int):
+    with db.connection() as conn:
+        meta = review.load_package(conn, package_no)
+        row = conn.execute(
+            "SELECT registered_at, sha256, codec, byte_size, "
+            "(SELECT COUNT(*) FROM originals WHERE package_no = ?) AS supplements "
+            "FROM packages WHERE package_no = ?",
+            (package_no, package_no),
+        ).fetchone()
+    return {
+        "package_no": meta.package_no,
+        "sample_count": meta.sample_count,
+        "old_interval": {"lower": meta.old_lower, "upper": meta.old_upper},
+        "error_limit": meta.eps,
+        "approximated": meta.approximated,
+        "registered_at": row["registered_at"],
+        "sha256": row["sha256"],
+        "codec": row["codec"],
+        "bytes": row["byte_size"],
+        "supplemented_samples": row["supplements"],
+    }
+
+
+@app.post(
+    "/api/review/packages/{package_no}/rejudge",
+    summary="按新合格闭区间复判采样号范围",
+    responses={
+        200: {"description": "逐点返回 偏窄 / 合格 / 偏宽 / 待查"},
+        400: {"description": "包号或采样号范围不合法"},
+    },
+)
+def rejudge_range(package_no: int, request: RejudgeRequest):
+    # All sample rows and supplemented originals for this range are read in
+    # one transaction.  Under WAL that is a single committed snapshot even if
+    # a supplement batch commits while this query is running.
+    with db.connection() as conn:
+        return review.rejudge(
+            conn, package_no, request.first_sample, request.last_sample,
+            request.lower, request.upper,
+        )
+
+
+@app.post(
+    "/api/review/packages/{package_no}/supplements",
+    summary="批量补录采样号与原值",
+    responses={
+        200: {"description": "整批写入成功（含同值重传）"},
+        400: {"description": "整批退回：采样号无效、超出可能范围或同点异值"},
+    },
+)
+def supplement_samples(package_no: int, request: SupplementRequest):
+    entries = [entry.model_dump() for entry in request.samples]
+    with db.connection(write=True) as conn:
+        return review.supplement(conn, package_no, entries)

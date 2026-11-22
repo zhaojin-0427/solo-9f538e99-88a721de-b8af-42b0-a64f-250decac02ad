@@ -1,7 +1,16 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app import pack
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _isolated_database(tmp_path, monkeypatch):
+    # These tests only exercise packaging, but /healthz touches SQLite; keep
+    # the developer's real data/review.db untouched.
+    monkeypatch.setenv("GAUGE_DB_PATH", str(tmp_path / "api.db"))
+
 
 client = TestClient(app)
 
@@ -21,7 +30,9 @@ def upload(values, lower=1434000, upper=1436000, eps=0, byte_limit=1_000_000):
 
 
 def test_health_and_docs():
-    assert client.get("/healthz").json() == {"status": "ok"}
+    health = client.get("/healthz").json()
+    assert health["status"] == "ok"
+    assert health["database"] == "ready"
     assert client.get("/docs").status_code == 200
     assert client.get("/openapi.json").status_code == 200
 

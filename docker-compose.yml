@@ -4,9 +4,18 @@ services:
     image: gauge-handoff:local
     ports:
       - "8000:8000"
+    environment:
+      # SQLite file used for registered packages and supplements.  The volume
+      # below makes it survive container restarts and rebuilds.
+      GAUGE_DB_PATH: /data/review.db
+    volumes:
+      - handoff-data:/data
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  handoff-data:
